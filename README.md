@@ -1,13 +1,87 @@
 # wikipedia-speedbot
-A python program that is performance-wise equivalent to Green Code's wikipedia speedrun bot (Player1)
 
-## Explaining The Different Bots
+A turbocharged, GPU-ready Wikipedia speedrunning toolkit inspired by Green Code's Player1 — but upgraded for modern hardware, modular bots, and a blazing-fast SBERT HTTP server.
 
-### Player1_speedrunner.py
-Basically just a copy of Green Code's optimized BERT with a visited pages list to avoid it looping.
+This project is built for experimentation, extensibility, and **speedrunning Wikipedia with actual style**.
 
-### Player1p5_speedrunner.py
-Clone of Player1, with further smartness like beam search.
+---
 
-### Player2_speedrunner.py
-TODO: LLM-based
+## 🚀 Architecture Overview
+
+### **`sbert_server.py`** — The SBERT Embedding Server
+
+A FastAPI + Uvicorn microservice that:
+
+* Loads SentenceTransformer **once** (GPU-accelerated if available)
+* Exposes `/embed` for fast batched embeddings
+* Prevents cold-boot delays during runs
+
+> **Required if using Player1.5** (recommended).
+
+---
+
+### **`Player1_speedrunner.py`** — Minimal, Fast, & Deterministic
+
+A simplified implementation of Green Code's Player1 algorithm:
+
+* Uses SBERT anchor-text similarity
+* Maintains a visited-set to prevent loops
+* No beam search
+* Fastest deterministic mode
+
+---
+
+### **`Player1p5_speedrunner.py`** — Smart Mode w/ Beam Search
+
+A more strategic version of Player1:
+
+* Uses the **SBERT HTTP server** exclusively
+* Adds beam search via summary embeddings
+* Selects links using multi-stage ranking
+* Much smarter navigation without big performance hits
+
+This is the flagship bot for high-quality runs.
+
+---
+
+### **`Player2_speedrunner.py`** — (Coming Soon)
+
+Future experimental mode using an LLM-based policy:
+
+* Will reason over page context
+* Will support hybrid SBERT + LLM routing
+* Might even support chain-of-thought search trees
+
+Stay tuned.
+
+---
+
+## 🧩 Requirements
+
+See `requirements.txt` for full dependencies.
+
+---
+
+## 🏃‍♂️ Getting Started
+
+### 1. Start the SBERT Server
+
+```
+python sbert_server.py --port 8000 --device auto
+```
+
+This loads SBERT once and keeps it hot.
+
+### 2. Run a Player
+
+```
+python Player1p5_speedrunner.py --start "Andrej Karpathy" --target "Cat" --sbert-url http://127.0.0.1:8000
+```
+
+---
+
+## 📜 License
+
+MIT
+
+Feel free to fork, hack, mod, or use in your own YouTube video. Let's break Wikipedia together.
