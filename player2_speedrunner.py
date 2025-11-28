@@ -23,9 +23,7 @@ WIKI_BASE = "https://en.wikipedia.org"
 WIKI_SUMMARY_API = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/123.0.0.0 Safari/537.36"
+    "User-Agent": "wiki-speedrunner/2.0-llm-semantic"
 }
 
 
@@ -44,9 +42,15 @@ def same_page(a: str, b: str) -> bool:
     return normalize_wiki_url(a).lower() == normalize_wiki_url(b).lower()
 
 
+PAGE_CACHE = {}
+
 def fetch_page(url: str) -> str:
+    if url in PAGE_CACHE:
+        return PAGE_CACHE[url]
+    time.sleep(0.3)
     r = requests.get(url, timeout=20, headers=HEADERS)
     r.raise_for_status()
+    PAGE_CACHE[url] = r.text
     return r.text
 
 
