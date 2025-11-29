@@ -48,40 +48,6 @@ This is the flagship bot for high-quality runs.
 
 Uses a combination of Player1.5's SBERT model (for link grabbing) and a LLM (for knowing what link is the best one).
 
----
-
-### Antivirus / Security Note Regarding Player3
-
-Player3 makes a lot of automated HTTP requests while it runs, for example:
-
-- To **Wikipedia** – to fetch pages and summaries
-- To **whatever LLM endpoint you configure** – e.g. OpenRouter, or your own local OpenAI-compatible server
-- (Optionally) to a local **SBERT embedding server** if you pass `--sbert-url`
-
-Because of this “bot-like” network behaviour, some antivirus products (e.g. Bitdefender) may occasionally flag the script with a **generic bot / automation heuristic**. This does *not* mean the script is malware by itself – it just means the behaviour matches a pattern they sometimes associate with bots or scrapers.
-
-A few important points:
-
-- The code is **fully open source** – you can audit exactly what it does.
-- It does **not** modify the registry, install drivers, or touch system settings.
-- It only talks to:
-  - Wikipedia
-  - The LLM endpoint you explicitly configure
-  - An optional local SBERT server (if you run one)
-
-If your antivirus flags it:
-
-- Treat it like any other dev tool:  
-  - Review the code yourself and make sure you’re comfortable with it.
-  - Run it in a virtual environment / throwaway VM if you prefer.
-- Only if you’re satisfied it’s safe, you may choose to add an exception for:
-  - Your Python interpreter path
-  - This project’s folder
-
-**Do not fully disable your antivirus.** If you’re unsure or the detection looks suspicious, lean on the side of caution.
-
----
-
 
 ## 🧩 Requirements
 

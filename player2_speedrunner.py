@@ -191,7 +191,7 @@ class LLMClient:
         model: str,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        timeout: float = 6.0,
+        timeout: float = 15.0,
     ):
         provider = provider.lower().strip()
         if provider not in {"local", "openrouter"}:
@@ -201,6 +201,10 @@ class LLMClient:
         self.model = model
         self.timeout = timeout
         self.session = requests.Session()
+
+        self.last_raw_choice = None
+        self.last_hidden_reasoning = None
+        self.last_hidden_reasoning_details = None
 
         if provider == "openrouter":
             self.base_url = base_url.rstrip("/") if base_url else "https://openrouter.ai/api"
@@ -241,21 +245,37 @@ class LLMClient:
             r = self.session.post(url, json=payload, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
-            content = data["choices"][0]["message"]["content"]
 
-            # Normalize to string
-            if isinstance(content, str):
-                return content
+            choice = data["choices"][0]
+            msg = choice.get("message") or {}
+
+            # 🔎 store raw choice + hidden reasoning for later inspection
+            self.last_raw_choice = choice
+            self.last_hidden_reasoning = msg.get("reasoning")
+            self.last_hidden_reasoning_details = msg.get("reasoning_details")
+
+            # Primary path: normal content
+            content = msg.get("content")
+
+            # Some providers might put content in delta instead
+            if (not content or not str(content).strip()) and "delta" in choice:
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+
+            # If still empty, we DO NOT silently swallow: we'll decide later
+            if not content or not str(content).strip():
+                # Don't invent anything here; let caller know it's empty
+                raise RuntimeError("LLM returned empty or null content")
+
             return str(content)
+
         except Exception as e:
-            if "429" in str(e):
-                time.sleep(1.0)  # small delay so you don't instantly retry into another 429
-            # Return a fake "response" that _ask_llm_for_choice can parse as reasoning-only.
-            return (
-                "REASONING:\n"
-                f"(LLM error: {e}. Falling back to first candidate.)\n\n"
-                "CHOICE: 1\n"
-            )
+            # Let higher-level logic handle fallback; but keep a parseable stub
+            # so _ask_llm_for_choice() doesn't explode.
+            return f"REASONING:\n(LLM error in chat(): {e})\n\nCHOICE: 1"
+
+
+
 
 
 # -------------------------------------------------------------------
@@ -542,8 +562,30 @@ class Player2SemanticLLM(Player):
             reply = self.llm.chat(
                 [system_msg, user_msg],
                 temperature=0.0,
-                max_tokens=256,
+                max_tokens=2048,
             )
+            # NEW: capture raw response object (store in LLMClient)
+            raw = getattr(self.llm, "_last_raw_response", None)
+
+            # Extract visible reasoning (from the prompt format)
+            reasoning_match = re.search(r"REASONING:(.*?)(?:CHOICE:|\Z)", reply, re.S)
+            reasoning_text = reasoning_match.group(1).strip() if reasoning_match else reply.strip()
+
+            # Extract internal reasoning (if supported)
+            internal_reasoning = None
+            if raw:
+                try:
+                    choice = raw.get("choices", [{}])[0]
+                    msg = choice.get("message") or {}
+
+                    internal_reasoning = (
+                        msg.get("reasoning")
+                        or (msg.get("reasoning_details") or [{}])[0].get("text")
+                    )
+                    if internal_reasoning:
+                        internal_reasoning = internal_reasoning.strip()
+                except Exception:
+                    pass
         except Exception as e:
             self.llm_fail_count += 1
             reasoning = f"(LLM error: {e}. Falling back to first candidate.)"
@@ -849,9 +891,34 @@ class Player2SemanticLLM(Player):
         chosen = candidates[choice_idx]
 
         if show_reasoning:
-            print("\n===== LLM REASONING =====")
+            # 1) Parsed reasoning from the model's visible content
+            print("\n===== LLM REASONING (parsed from content) =====")
             print(reasoning)
-            print("=========================\n")
+            print("==============================================\n")
+
+            # 2) Actual provider-side reasoning, if available (OpenRouter, Qwen3, etc.)
+            hidden = getattr(self.llm, "last_hidden_reasoning", None)
+            hidden_details = getattr(self.llm, "last_hidden_reasoning_details", None)
+
+            # Prefer `reasoning` if present
+            if hidden and str(hidden).strip():
+                print("===== LLM INTERNAL REASONING (provider `reasoning`) =====")
+                print(hidden)
+                print("=========================================================\n")
+            elif isinstance(hidden_details, list) and hidden_details:
+                # Many providers put the actual reasoning into reasoning_details[].text
+                # We'll just join them for display purposes.
+                texts = [
+                    d.get("text", "")
+                    for d in hidden_details
+                    if isinstance(d, dict) and d.get("text")
+                ]
+                joined = "\n".join(texts).strip()
+                if joined:
+                    print("===== LLM INTERNAL REASONING (provider `reasoning_details`) =====")
+                    print(joined)
+                    print("=================================================================\n")
+
 
         if visualize:
             print("\n  LLM chose:")
