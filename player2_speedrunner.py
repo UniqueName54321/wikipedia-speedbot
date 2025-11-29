@@ -191,7 +191,9 @@ class LLMClient:
         model: str,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        timeout: float = 15.0,
+        timeout: float = 6.0,
+        max_retries: int = 4,
+        min_call_interval: float = 0.0,  # seconds between calls to avoid hammering
     ):
         provider = provider.lower().strip()
         if provider not in {"local", "openrouter"}:
@@ -201,10 +203,12 @@ class LLMClient:
         self.model = model
         self.timeout = timeout
         self.session = requests.Session()
-
         self.last_raw_choice = None
         self.last_hidden_reasoning = None
         self.last_hidden_reasoning_details = None
+        self.max_retries = max_retries
+        self.min_call_interval = min_call_interval
+        self._last_call_ts = 0.0
 
         if provider == "openrouter":
             self.base_url = base_url.rstrip("/") if base_url else "https://openrouter.ai/api"
@@ -241,38 +245,65 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
-        try:
-            r = self.session.post(url, json=payload, headers=headers, timeout=self.timeout)
-            r.raise_for_status()
-            data = r.json()
+        # simple spacing between requests to be nice
+        now = time.time()
+        if self.min_call_interval > 0 and now - self._last_call_ts < self.min_call_interval:
+            time.sleep(self.min_call_interval - (now - self._last_call_ts))
 
-            choice = data["choices"][0]
-            msg = choice.get("message") or {}
+        last_error = None
 
-            # 🔎 store raw choice + hidden reasoning for later inspection
-            self.last_raw_choice = choice
-            self.last_hidden_reasoning = msg.get("reasoning")
-            self.last_hidden_reasoning_details = msg.get("reasoning_details")
+        self.last_raw_choice = None
+        self.last_hidden_reasoning = None
+        self.last_hidden_reasoning_details = None
 
-            # Primary path: normal content
-            content = msg.get("content")
+        for attempt in range(self.max_retries):
+            try:
+                r = self.session.post(url, json=payload, headers=headers, timeout=self.timeout)
+                # Handle 429 explicitly without raising yet
+                if r.status_code == 429:
+                    # Try to respect Retry-After if present
+                    retry_after = r.headers.get("Retry-After")
+                    if retry_after is not None:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = 2.0
+                    else:
+                        # exponential backoff: 1, 2, 4, 8...
+                        delay = 2.0 ** attempt
+                    time.sleep(delay)
+                    last_error = f"429 Too Many Requests (attempt {attempt + 1}/{self.max_retries})"
+                    continue
 
-            # Some providers might put content in delta instead
-            if (not content or not str(content).strip()) and "delta" in choice:
-                delta = choice.get("delta") or {}
-                content = delta.get("content")
+                # Any other non-2xx → raise
+                r.raise_for_status()
+                data = r.json()
+                self._last_call_ts = time.time()
 
-            # If still empty, we DO NOT silently swallow: we'll decide later
-            if not content or not str(content).strip():
-                # Don't invent anything here; let caller know it's empty
-                raise RuntimeError("LLM returned empty or null content")
+                # store raw response for debugging
+                self.last_raw_choice = data
 
-            return str(content)
+                # try to pull out any provider-side reasoning if it exists
+                # (schema is provider-dependent, so keep this defensive)
+                reasoning = data.get("reasoning")
+                reasoning_details = data.get("reasoning_details")
 
-        except Exception as e:
-            # Let higher-level logic handle fallback; but keep a parseable stub
-            # so _ask_llm_for_choice() doesn't explode.
-            return f"REASONING:\n(LLM error in chat(): {e})\n\nCHOICE: 1"
+                # some providers might nest this somewhere else; adapt as needed later
+                self.last_hidden_reasoning = reasoning
+                self.last_hidden_reasoning_details = reasoning_details
+
+                content = data["choices"][0]["message"]["content"]
+                return content if isinstance(content, str) else str(content)
+
+
+            except Exception as e:
+                last_error = str(e)
+                # small backoff on random network issues
+                time.sleep(1.0 * (attempt + 1))
+
+        # If we get here, we failed all retries → let caller handle
+        raise RuntimeError(f"LLM chat failed after {self.max_retries} retries. Last error: {last_error}")
+
 
 
 
@@ -282,20 +313,17 @@ class LLMClient:
 # PLAYER 2 — SEMANTIC + LLM
 # -------------------------------------------------------------------
 
-class Player2SemanticLLM(Player):
-    """
-    Player2 that:
-      1. Uses SBERT (optional) to semantically rank links vs target.
-      2. Fetches Wikipedia summaries for top links.
-      3. Asks an LLM to pick the best next hop, given titles + summaries.
-    """
+from collections import Counter
 
+class Player2SemanticLLM(Player):
     def __init__(
         self,
         llm_client: LLMClient,
         sbert_url: Optional[str] = None,
         shortlist_size: int = 8,
         summary_weight: float = 0.4,
+        mcts_rollouts: int = 0,   # NEW: 0 = disabled
+        mcts_depth: int = 3,      # NEW: lookahead depth
     ):
         super().__init__()
         self.llm = llm_client
@@ -306,11 +334,15 @@ class Player2SemanticLLM(Player):
         self._target_emb_cache: Dict[str, np.ndarray] = {}
         self._summary_cache: Dict[str, Tuple[str, np.ndarray]] = {}
 
-        # NEW: run log for JSON output
         self.run_log: List[Dict] = []
-
-        # NEW: track repeated LLM failures so we can fall back
         self.llm_fail_count: int = 0
+
+        # NEW: topic histogram to penalize overused themes
+        self.topic_hist: Counter[str] = Counter()
+
+        self.mcts_rollouts = mcts_rollouts
+        self.mcts_depth = mcts_depth
+
 
 
     def __str__(self):
@@ -319,6 +351,41 @@ class Player2SemanticLLM(Player):
         return "Player2_LLM"
 
     # ---------- semantic helpers ----------
+
+    def _candidate_tokens(self, cand: Dict[str, str]) -> Set[str]:
+        title = title_from_url(cand.get("href", "") or "")
+        summary = cand.get("summary") or ""
+        anchor = cand.get("text") or cand.get("anchor") or ""
+        text = " ".join([title, anchor, summary])
+        return self._tokenize(text)
+
+    def _hist_penalty(self, cand: Dict[str, str], penalty_scale: float = 0.05) -> float:
+        """
+        penalty_scale ~0.02–0.1 is usually reasonable.
+        Higher = more aggressive avoidance of repeated topics.
+        """
+        toks = self._candidate_tokens(cand)
+        if not toks:
+            return 0.0
+        # Sum frequencies of tokens we've seen before
+        freq = sum(self.topic_hist[t] for t in toks)
+        return penalty_scale * float(freq)
+
+    def _augmented_score(self, cand: Dict[str, str], default_score: float = 1e9) -> float:
+        """
+        Base score (semantic distance) + histogram penalty.
+        Lower is better.
+        """
+        base = float(cand.get("score", default_score))
+        return base + self._hist_penalty(cand)
+    
+    def _update_topic_hist(self, chosen: Dict[str, str]):
+        """
+        Update histogram with tokens from the chosen candidate.
+        """
+        toks = self._candidate_tokens(chosen)
+        self.topic_hist.update(toks)
+
 
     def _trim_summary(self, text: str, max_chars: int = 300) -> str:
         if not text:
@@ -519,6 +586,7 @@ class Player2SemanticLLM(Player):
         """
         if not candidates:
             return 0, "(no candidates)"
+    
 
         lines = []
         for i, link in enumerate(candidates, start=1):
@@ -553,7 +621,8 @@ class Player2SemanticLLM(Player):
                 "Think step-by-step, then respond in the format:\n\n"
                 "REASONING:\n"
                 "<your reasoning, where you clearly state which OPTION NUMBER is best and why. "
-                "The option number you argue is best MUST match the final CHOICE.>\n\n"
+                "The option number you argue is best MUST match the final CHOICE.>\n"
+                "Your response must ALWAYS end with 'CHOICE: <number>' WITHOUT SINGLE QUOTES where <number> is the option number you choose.\n\n"
                 "CHOICE: <number>\n"
             ),
         }
@@ -640,7 +709,130 @@ class Player2SemanticLLM(Player):
             idx = 0
 
         return idx, reasoning_text
+    
+    # ========== Monto Carlos Tree Search (simulated using SBERT because LLM quota) ===========
 
+    def _simulate_greedy_walk(
+        self,
+        start_url: str,
+        target_url: str,
+        target_desc: str,
+        depth: int,
+        allow_non_mainspace: bool = False,
+    ) -> Tuple[bool, int]:
+        """
+        Do a cheap, semantic-only greedy walk of up to `depth` steps.
+        Returns (hit_target, steps_taken_if_hit_or_depth).
+        No LLM calls, no logging, no topic_hist updates.
+        """
+        current = normalize_wiki_url(start_url)
+        target_norm = normalize_wiki_url(target_url)
+        visited = {current}
+
+        for step in range(depth):
+            if same_page(current, target_norm):
+                return True, step
+
+            try:
+                html = fetch_page(current)
+            except Exception:
+                return False, depth
+
+            links = extract_links(html, allow_non_mainspace=allow_non_mainspace)
+            if not links:
+                return False, depth
+
+            # Minimal semantic shortlist: ignore LLM & hist, just SBERT if available.
+            clean_links = []
+            for l in links:
+                href = normalize_wiki_url(l["href"])
+                if href in visited:
+                    continue
+                l = dict(l)
+                l["href"] = href
+                clean_links.append(l)
+
+            if not clean_links:
+                return False, depth
+
+            # If we see a direct hit, shortcut
+            for l in clean_links:
+                if same_page(l["href"], target_norm):
+                    return True, step + 1
+
+            # Simple lexical shortlist towards target_desc
+            shortlist = self._lexical_shortlist(clean_links, target_desc, max_size=8)
+
+            if self.sbert:
+                try:
+                    target_emb = self._embed_target(target_desc)
+                    anchor_texts = [l["text"] for l in shortlist]
+                    anchor_emb = self._embed_texts(anchor_texts)
+                    anchor_dis = self._cosine_dist(anchor_emb, target_emb)
+                    # choose best by distance
+                    best_idx = int(np.argmin(anchor_dis))
+                    next_link = shortlist[best_idx]
+                except Exception:
+                    next_link = shortlist[0]
+            else:
+                next_link = shortlist[0]
+
+            current = next_link["href"]
+            if current in visited:
+                return False, depth
+            visited.add(current)
+
+        # Reached depth without hitting target
+        return same_page(current, target_norm), depth
+    
+    def _score_candidate_with_rollouts(
+        self,
+        cand: Dict[str, str],
+        target_url: str,
+        target_desc: str,
+        allow_non_mainspace: bool,
+    ) -> float:
+        """
+        Lower is better. Combines:
+          - success rate over rollouts
+          - avg steps-to-hit (if hit)
+          - base semantic score + histogram penalty
+        """
+        if self.mcts_rollouts <= 0:
+            # just use existing augmented score
+            return self._augmented_score(cand)
+
+        start_url = cand["href"]
+        hits = 0
+        steps_sum = 0
+
+        for _ in range(self.mcts_rollouts):
+            try:
+                hit, steps = self._simulate_greedy_walk(
+                    start_url=start_url,
+                    target_url=target_url,
+                    target_desc=target_desc,
+                    depth=self.mcts_depth,
+                    allow_non_mainspace=allow_non_mainspace,
+                )
+            except Exception:
+                continue
+
+            if hit:
+                hits += 1
+                steps_sum += steps
+
+        base = self._augmented_score(cand)
+
+        if hits == 0:
+            # Never hit in rollout: penalize candidate
+            # big constant so actual hits are strongly preferred
+            return base + 5.0
+        else:
+            avg_steps = steps_sum / hits
+            # Reward early hits: base + avg_steps (lower is better)
+            # You can tune the weight here if you want.
+            return base + 0.5 * avg_steps
 
     # ---------- main decision function ----------
 
@@ -662,6 +854,9 @@ class Player2SemanticLLM(Player):
         target_norm = normalize_wiki_url(target_url)
         current_title = title_from_url(page_url)
         target_title = title_from_url(target_norm)
+
+        if current_title == target_title:
+            return None
 
         clean_links: List[Dict[str, str]] = []
 
@@ -703,6 +898,7 @@ class Player2SemanticLLM(Player):
                         reasoning="No unvisited mainspace links remaining; choosing first unvisited.",
                         source="semantic_fallback",
                     )
+                    self._update_topic_hist(chosen)
                     return chosen
             chosen = links[0]
             self._log_step(
@@ -714,6 +910,7 @@ class Player2SemanticLLM(Player):
                 reasoning="Empty link set; falling back to first link.",
                 source="semantic_fallback",
             )
+            self._update_topic_hist(chosen)
             return chosen
 
         # 1b. DEDUPE by href
@@ -842,6 +1039,7 @@ class Player2SemanticLLM(Player):
                 reasoning=reasoning,
                 source="auto_heuristic",
             )
+            self._update_topic_hist(chosen)
             return chosen
 
         if visualize:
@@ -851,13 +1049,27 @@ class Player2SemanticLLM(Player):
 
         # 5. Ask LLM to pick best candidate (if not disabled by repeated failures)
         if self.llm_fail_count >= 3:
-            # Too many LLM errors: semantic fallback
-            if self.sbert and any("score" in c for c in candidates):
-                chosen = min(candidates, key=lambda c: c.get("score", float("inf")))
+            # Too many LLM errors: mcts fallback
+            if self.mcts_rollouts > 0:
+                chosen = min(
+                    candidates,
+                    key=lambda c: self._score_candidate_with_rollouts(
+                        c,
+                        target_url=target_url,
+                        target_desc=target_desc,
+                        allow_non_mainspace=False,
+                    ),
+                )
+                reasoning = (
+                    "LLM disabled due to repeated failures; using MCTS rollout refinement."
+                )
+            elif self.sbert and any("score" in c for c in candidates):
+                chosen = min(candidates, key=lambda c: self._augmented_score(c))
                 reasoning = (
                     "LLM disabled due to repeated failures; "
                     "using best semantic candidate (lowest score)."
                 )
+
             else:
                 chosen = candidates[0]
                 reasoning = (
@@ -878,6 +1090,7 @@ class Player2SemanticLLM(Player):
                 reasoning=reasoning,
                 source="semantic_fallback",
             )
+            self._update_topic_hist(chosen)
             return chosen
 
         choice_idx, reasoning = self._ask_llm_for_choice(
@@ -888,7 +1101,21 @@ class Player2SemanticLLM(Player):
             show_reasoning=show_reasoning,
         )
 
+        # First trust LLM
         chosen = candidates[choice_idx]
+
+        # Then let MCTS refine it
+        if self.mcts_rollouts > 0:
+            chosen = min(
+                candidates,
+                key=lambda c: self._score_candidate_with_rollouts(
+                    c,
+                    target_url=target_url,
+                    target_desc=target_desc,
+                    allow_non_mainspace=False,
+                ),
+            )
+
 
         if show_reasoning:
             # 1) Parsed reasoning from the model's visible content
@@ -934,15 +1161,16 @@ class Player2SemanticLLM(Player):
             source="llm",
         )
 
+        self._update_topic_hist(chosen)
         return chosen
 
+    
 
 
 
 # -------------------------------------------------------------------
 # MAIN SPEEDRUN LOOP
 # -------------------------------------------------------------------
-
 def run_speedrun(
     start_url: str,
     target_url: str,
@@ -1016,6 +1244,10 @@ def run_speedrun(
             beam_width=beam_width,
             show_reasoning=show_reasoning,
         )
+
+        if next_link is None:
+            print("Reached target!")
+            break
 
         current = normalize_wiki_url(next_link["href"])
 
